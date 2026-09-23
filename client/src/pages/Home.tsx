@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "reac
 import {
   Camera,
   Check,
+  Bell,
+  BellRing,
+  CheckCheck,
   Download,
   Eye,
   FileImage,
@@ -10,6 +13,7 @@ import {
   Mic,
   Play,
   ScanLine,
+  Send,
   ShieldCheck,
   Sparkles,
   StopCircle,
@@ -22,6 +26,8 @@ import { trpc } from "@/lib/trpc";
 
 type Mode = "scene" | "text" | "object";
 type HistoryItem = { id: number; time: string; mode: Mode; description: string };
+type NotificationItem = { id: number; title: string; message: string; time: string; read: boolean; kind: "result" | "system" | "custom" };
+type NotificationSettings = { enabled: boolean; result: boolean; camera: boolean; sound: boolean; browser: boolean };
 
 const modeLabels: Record<Mode, { label: string; hint: string }> = {
   scene: { label: "描述場景", hint: "整體畫面與安全提醒" },
@@ -61,11 +67,33 @@ export default function Home() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [lastScanAt, setLastScanAt] = useState<Date | null>(null);
   const [cameraError, setCameraError] = useState("");
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [customTitle, setCustomTitle] = useState("");
+  const [customMessage, setCustomMessage] = useState("");
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>({ enabled: true, result: true, camera: true, sound: true, browser: false });
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const scanInFlightRef = useRef(false);
   const analyzeMutation = trpc.vision.analyze.useMutation();
+
+  useEffect(() => {
+    try {
+      const savedNotifications = window.localStorage.getItem("vision-helper-notifications");
+      const savedSettings = window.localStorage.getItem("vision-helper-notification-settings");
+      if (savedNotifications) setNotifications(JSON.parse(savedNotifications) as NotificationItem[]);
+      if (savedSettings) setNotificationSettings({ ...notificationSettings, ...(JSON.parse(savedSettings) as Partial<NotificationSettings>) });
+    } catch { /* 使用預設通知設定 */ }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("vision-helper-notifications", JSON.stringify(notifications.slice(0, 30)));
+  }, [notifications]);
+
+  useEffect(() => {
+    window.localStorage.setItem("vision-helper-notification-settings", JSON.stringify(notificationSettings));
+  }, [notificationSettings]);
 
   const speak = useCallback((text: string) => {
     if (!text || !("speechSynthesis" in window)) {
@@ -82,6 +110,15 @@ export default function Home() {
     utterance.onerror = () => setIsSpeaking(false);
     window.speechSynthesis.speak(utterance);
   }, []);
+
+  const pushNotification = useCallback((title: string, message: string, kind: NotificationItem["kind"] = "system") => {
+    if (!notificationSettings.enabled || (kind === "result" && !notificationSettings.result) || (kind === "system" && !notificationSettings.camera)) return;
+    const item = { id: Date.now(), title, message, time: formatTime(), read: false, kind };
+    setNotifications(items => [item, ...items].slice(0, 30));
+    toast(title, { description: message });
+    if (notificationSettings.sound && kind === "system") speak(`${title}。${message}`);
+    if (notificationSettings.browser && "Notification" in window && Notification.permission === "granted") new Notification(title, { body: message });
+  }, [notificationSettings, speak]);
 
   const stopSpeaking = useCallback(() => {
     window.speechSynthesis?.cancel();
@@ -147,10 +184,11 @@ export default function Home() {
       }
       setIsCameraOn(true);
       toast.success("相機已啟用，可以開始辨識");
+      pushNotification("相機已啟用", "現在可以按下立即辨識或開啟自動辨識。", "system");
     } catch {
       setCameraError("無法存取相機。請在瀏覽器允許相機權限，或使用圖片上傳。");
     }
-  }, []);
+  }, [pushNotification]);
 
   const stopCamera = useCallback(() => {
     streamRef.current?.getTracks().forEach(track => track.stop());
@@ -158,7 +196,8 @@ export default function Home() {
     if (videoRef.current) videoRef.current.srcObject = null;
     setIsCameraOn(false);
     setAutoScan(false);
-  }, []);
+    pushNotification("相機已關閉", "已停止即時影像預覽。", "system");
+  }, [pushNotification]);
 
   useEffect(() => () => {
     streamRef.current?.getTracks().forEach(track => track.stop());
@@ -230,6 +269,26 @@ export default function Home() {
     stopSpeaking();
   };
 
+  const unreadCount = notifications.filter(item => !item.read).length;
+  const markNotificationsRead = () => setNotifications(items => items.map(item => ({ ...item, read: true })));
+  const updateNotificationSetting = (key: keyof NotificationSettings, value: boolean) => {
+    setNotificationSettings(settings => ({ ...settings, [key]: value }));
+    if (key === "browser" && value && "Notification" in window && Notification.permission === "default") void Notification.requestPermission();
+  };
+  const sendCustomNotification = () => {
+    const title = customTitle.trim() || "自訂提醒";
+    const message = customMessage.trim();
+    if (!message) {
+      toast.error("請先輸入通知內容");
+      return;
+    }
+    const item = { id: Date.now(), title, message, time: formatTime(), read: false, kind: "custom" as const };
+    setNotifications(items => [item, ...items].slice(0, 30));
+    toast(title, { description: message });
+    setCustomTitle("");
+    setCustomMessage("");
+  };
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -237,8 +296,28 @@ export default function Home() {
           <div className="brand-mark" aria-hidden="true"><Eye size={25} strokeWidth={2.4} /></div>
           <div><p className="eyebrow">VISION HELPER · 影像理解工具</p><h1>視覺助手</h1></div>
         </div>
-        <div className="topbar-status"><span className="status-dot" />語音優先 · 繁體中文</div>
+        <div className="topbar-tools">
+          <button className={`notification-trigger ${notificationsOpen ? "active" : ""}`} onClick={() => { setNotificationsOpen(open => !open); markNotificationsRead(); }} aria-expanded={notificationsOpen} aria-controls="notification-panel">
+            {unreadCount ? <BellRing size={18} /> : <Bell size={18} />}<span>通知</span>{unreadCount > 0 && <b>{unreadCount > 9 ? "9+" : unreadCount}</b>}
+          </button>
+          <div className="topbar-status"><span className="status-dot" />語音優先 · 繁體中文</div>
+        </div>
       </header>
+
+      {notificationsOpen && <aside className="notification-panel" id="notification-panel" aria-label="通知中心">
+        <div className="notification-panel-head"><div><p className="panel-index">NOTIFICATION CENTER</p><h3>自訂通知</h3></div><button className="close-notifications" onClick={() => setNotificationsOpen(false)} aria-label="關閉通知中心"><X size={18} /></button></div>
+        <p className="notification-intro">設定辨識完成、相機狀態與自訂提醒，讓重要資訊不會錯過。</p>
+        <div className="notification-settings">
+          <label className="setting-row"><span><strong>啟用通知中心</strong><small>在此裝置保存最近 30 則通知</small></span><input type="checkbox" checked={notificationSettings.enabled} onChange={event => updateNotificationSetting("enabled", event.target.checked)} /></label>
+          <label className="setting-row"><span><strong>辨識完成提示</strong><small>每次影像辨識完成時提醒</small></span><input type="checkbox" checked={notificationSettings.result} disabled={!notificationSettings.enabled} onChange={event => updateNotificationSetting("result", event.target.checked)} /></label>
+          <label className="setting-row"><span><strong>相機狀態提示</strong><small>開啟或關閉相機時提醒</small></span><input type="checkbox" checked={notificationSettings.camera} disabled={!notificationSettings.enabled} onChange={event => updateNotificationSetting("camera", event.target.checked)} /></label>
+          <label className="setting-row"><span><strong>通知語音</strong><small>用語音讀出系統通知</small></span><input type="checkbox" checked={notificationSettings.sound} disabled={!notificationSettings.enabled} onChange={event => updateNotificationSetting("sound", event.target.checked)} /></label>
+          <label className="setting-row"><span><strong>瀏覽器通知</strong><small>離開頁面時仍顯示桌面提示</small></span><input type="checkbox" checked={notificationSettings.browser} disabled={!notificationSettings.enabled} onChange={event => updateNotificationSetting("browser", event.target.checked)} /></label>
+        </div>
+        <div className="custom-notification-form"><p className="form-label">建立自訂提醒</p><input value={customTitle} onChange={event => setCustomTitle(event.target.value)} placeholder="通知標題（選填）" aria-label="通知標題" /><textarea value={customMessage} onChange={event => setCustomMessage(event.target.value)} placeholder="例如：記得確認出口方向" rows={2} aria-label="通知內容" /><button className="button button-accent" onClick={sendCustomNotification}><Send size={17} />加入通知</button></div>
+        <div className="notification-list-head"><span>最近通知</span><button onClick={markNotificationsRead}><CheckCheck size={15} />全部標為已讀</button></div>
+        <div className="notification-list">{notifications.length === 0 ? <div className="notification-empty"><Bell size={20} /><span>目前沒有通知</span></div> : notifications.slice(0, 8).map(item => <article className={`notification-item ${item.read ? "read" : ""}`} key={item.id}><span className={`notification-kind ${item.kind}`} /><div><strong>{item.title}</strong><p>{item.message}</p><small>{item.time}</small></div></article>)}</div>
+      </aside>}
 
       <section className="hero-block" aria-labelledby="page-title">
         <div>
